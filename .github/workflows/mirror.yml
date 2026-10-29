@@ -1,0 +1,68 @@
+name: Mirror compai
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_HOST: gitlab-ext.utu.fi
+  UPSTREAM_PATH: tt.utu.fi/compai
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check upstream visibility
+        id: vis
+        run: |
+          enc="${UPSTREAM_PATH//\//%2F}"
+          code=$(curl -sS -o /tmp/project.json -w '%{http_code}' \
+            "https://${UPSTREAM_HOST}/api/v4/projects/${enc}") || code=000
+          echo "HTTP status: $code"
+          case "$code" in
+            200)
+              v=$(jq -r '.visibility' /tmp/project.json)
+              if [ "$v" = "public" ]; then echo "state=public" >> "$GITHUB_OUTPUT"
+              else echo "state=restricted" >> "$GITHUB_OUTPUT"; fi ;;
+            # Anonymous requests get 401/403/404 when the project is internal or private
+            401|403|404) echo "state=restricted" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Could not determine visibility (status $code); leaving this repo unchanged."; exit 1 ;;
+          esac
+
+      - name: Make this repository private
+        if: steps.vis.outputs.state == 'restricted'
+        env:
+          # Fine-grained PAT or classic token with repo administration rights
+          GH_TOKEN: ${{ secrets.REPO_ADMIN_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Upstream is no longer public, but secret REPO_ADMIN_TOKEN is not set; cannot make repo private."
+            exit 1
+          fi
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}" -f visibility=private
+
+      - uses: actions/checkout@v4
+        if: steps.vis.outputs.state == 'public'
+
+      - name: Pull latest upstream
+        if: steps.vis.outputs.state == 'public'
+        run: |
+          git clone --depth 1 "https://${UPSTREAM_HOST}/${UPSTREAM_PATH}.git" /tmp/upstream
+          rm -rf /tmp/upstream/.git /tmp/upstream/.github/workflows
+          # Replace tracked content, but keep this mirror's own workflows and .git
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github -exec rm -rf {} +
+          find .github -mindepth 1 -maxdepth 1 ! -name workflows -exec rm -rf {} + 2>/dev/null || true
+          cp -a /tmp/upstream/. .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Already up to date."
+          else
+            git commit -m "Sync from ${UPSTREAM_HOST}/${UPSTREAM_PATH}"
+            git push
+          fi
